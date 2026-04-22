@@ -173,4 +173,10 @@ examples/conus1/subdomains
 examples/al_app_plateau/input
 examples/al_app_plateau/output
 examples/al_app_plateau/execution/cache
-examples/al_app_plateau/visualization
+examples/al_app_plateau/validation/peterson_jones_2025/cuahsi_downloads
+examples/konza/execution/cache
+examples/konza/input/wtd
+examples/konza/input/*.tiff
+examples/konza/input/soil_texture.gpkg
+examples/konza/input/domain_buf.gpkg
+examples/konza/output
