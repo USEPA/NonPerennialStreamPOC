@@ -1,4 +1,9 @@
 import os,sys,twtnamelist,folium,geopandas,branca,numpy,rasterio,rasterio.warp,rasterio.io
+import math
+import numpy as np
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling, transform_bounds
+from rasterio.transform import array_bounds
 
 class twtfoliummap(folium.Map):
 
@@ -92,7 +97,7 @@ class twtfoliummap(folium.Map):
                        fname=fname,
                        cmap=cmap)
 
-    def add_nonperennial_strm_classification(self,namelist:twtnamelist.Namelist,fname:str=None):
+    def add_nonperennial_strm_classification(self,fname:str=None):
         """Add non-perennial stream classification to self"""
         if fname is None: fname = self.fname_nonperennial
         if not os.path.isfile(fname): 
@@ -102,74 +107,193 @@ class twtfoliummap(folium.Map):
                         fname=fname,
                         cmap=cmap)
                 
-    def add_perennial_strm_classification(self,namelist:twtnamelist.Namelist,fname:str=None):
+    def add_perennial_strm_classification(self,fname:str=None):
         """Get folium map of mean WTD values"""
         if fname is None: fname = self.fname_perennial
         if not os.path.isfile(fname): 
             sys.exit(f'ERROR add_perennial_strm_classification could not find {fname}')
-        cmap = branca.colormap.LinearColormap(['white','red'], vmin=0, vmax=1)
+        cmap = {1: "#ff0000"}
         if os.path.isfile(fname):
             self._add_grid(name=f'WTD-TWI Perennial',
                             fname=fname,
                             cmap=cmap)
         html_legend = """
         <div style="position: fixed; 
-        bottom: 10px; left: 10px; width: 200px; height: auto; 
+        bottom: 10px; left: 10px; width: 150px; height: auto; 
         border:2px solid grey; z-index:9999; font-size:14px;
         background-color:white; opacity: 0.85; padding: 10px;">
-        &nbsp; <b>WTD-TWI Classification</b> <br>
         """
-        html_legend += f'<div style="display: flex; align-items: center; margin-bottom: 5px;"><div style="width: 20px; height: 20px; background-color: {cmap(1)}; margin-right: 5px;"></div>{'Perennial'}</div>'
+        html_legend += f'<div style="display: flex; align-items: center; margin-bottom: 5px;"><div style="width: 20px; height: 20px; background-color: {cmap[1]}; margin-right: 5px;"></div>{'Perennial'}</div>'
         html_legend += "</div>"
         self.get_root().html.add_child(folium.Element(html_legend))
+        #&nbsp; <b>WTD-TWI Classification</b> <br>
 
-    def _add_grid(self,name:str,fname:str,cmap:branca.colormap.ColorMap|dict):
-        """Add gridded data to folium map"""
-        if not os.path.isfile(fname): 
+    def _add_grid(self, name: str, fname: str, cmap: "branca.colormap.ColorMap | dict"):
+        """Add gridded data to a Folium map as a palettized PNG data-URI.
+        
+        - NaNs are transparent (palette index 0).
+        - Continuous case (vmin != vmax) uses the provided ColorMap (branca) for the palette and adds a legend.
+        - Binary/degenerate case (all finite pixels have the same value, e.g., 1/NaN) maps all finite pixels to a single color
+        and adds a simple legend.
+        
+        Args:
+            name: Layer/legend name.
+            fname: Path to a single-band GeoTIFF.
+            cmap: Either a branca ColorMap (for continuous data) or a dict for the binary case, e.g., {1: "#1f78b4"}.
+        """
+        import os, sys, math, io, base64, re
+        import numpy as np
+        import folium
+        import branca
+        import rasterio
+        from rasterio.warp import calculate_default_transform, reproject, Resampling, transform_bounds
+        from rasterio.transform import array_bounds
+        from PIL import Image
+
+        if not os.path.isfile(fname):
             sys.exit(f'ERROR _add_grid could not find {fname}')
-        if (fname.endswith('.tif') or fname.endswith('.tiff')) == -1: 
-            sys.exit('ERROR _add_grid fname does not end in .tif '+fname)
+        if not (fname.endswith('.tif') or fname.endswith('.tiff')):
+            sys.exit('ERROR _add_grid fname does not end in .tif ' + fname)
+
+        def _hex_to_rgb(h: str):
+            s = h.lstrip('#')
+            if len(s) in (3, 4):  # short hex like #abc or #rgba
+                s = ''.join(ch * 2 for ch in s[:3])
+            return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+
+        def _parse_color_to_rgb(c):
+            # Accept '#RRGGBB', '#RRGGBBAA', 'rgb(r,g,b)', 'rgba(r,g,b,a)', or tuples/lists
+            if isinstance(c, str):
+                c = c.strip()
+                if c.startswith('#'):
+                    return _hex_to_rgb(c)
+                m = re.match(r'rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)', c)
+                if m:
+                    r, g, b = m.groups()
+                    # Values may be 0-255 or 0-1 floats; cast safely to 0-255
+                    vals = [float(r), float(g), float(b)]
+                    if max(vals) <= 1.0:
+                        vals = [int(round(v * 255)) for v in vals]
+                    else:
+                        vals = [int(round(v)) for v in vals]
+                    return tuple(np.clip(vals, 0, 255).astype(int).tolist())
+                # Fallback: try hex without '#'
+                try:
+                    return _hex_to_rgb('#' + c)
+                except Exception:
+                    return (31, 120, 180)  # default
+            if isinstance(c, (tuple, list)) and len(c) >= 3:
+                vals = list(c[:3])
+                # If floats 0-1, scale; if ints 0-255, keep
+                if any(isinstance(v, float) for v in vals) and max(vals) <= 1.0:
+                    vals = [int(round(v * 255)) for v in vals]
+                vals = [int(round(v)) for v in vals]
+                return tuple(np.clip(vals, 0, 255).astype(int).tolist())
+            return (31, 120, 180)
+
         folium_crs = "EPSG:3857"
         with rasterio.open(fname, 'r') as src:
-            dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
+            # Compute target grid in Web Mercator
+            dst_transform, dst_width, dst_height = calculate_default_transform(
                 src.crs, folium_crs, src.width, src.height, *src.bounds
             )
-            src_prj_meta = src.meta.copy()
-            src_prj_meta.update({
-                'driver': 'GTIFF',
-                'crs': folium_crs,
-                'transform': dst_transform,
-                'width': dst_width,
-                'height': dst_height,
-                'nodata': numpy.nan,
-                'count': 1,
-                'dtype': 'float64'
-            })
-            with rasterio.io.MemoryFile().open(**src_prj_meta) as src_prj:
-                rasterio.warp.reproject(
-                    source=rasterio.band(src, 1),
-                    destination=rasterio.band(src_prj, 1),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=dst_transform,
-                    dst_crs=folium_crs,
-                    resampling=rasterio.enums.Resampling.nearest
-                )
-                bbox = rasterio.warp.transform_bounds(src_prj.crs, "EPSG:4326", *src_prj.bounds)
-                vals = src_prj.read(1)
-                vmin,vmax = numpy.nanmin(vals),numpy.nanmax(vals)
-                if vmin != vmax:                       
-                    cmap = cmap.scale(vmin, vmax)
-                    cmap.caption = name
-                    cmap.add_to(self)
-                cmapf = lambda x: (0, 0, 0, 0) if numpy.isnan(x) else cmap.rgba_floats_tuple(x)
-                folium.raster_layers.ImageOverlay(
-                    name=name,
-                    image=vals,
-                    bounds=[[bbox[1], bbox[0]], [bbox[3], bbox[2]]],
-                    colormap=cmapf
-                ).add_to(self)
 
+            # Reproject into a float32 array with NaN as nodata
+            vals = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=vals,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=dst_transform,
+                dst_crs=folium_crs,
+                resampling=Resampling.nearest,
+                src_nodata=src.nodata,
+                dst_nodata=np.nan,
+            )
+
+            # Bounds in lat/lon for Leaflet
+            bounds_merc = array_bounds(dst_height, dst_width, dst_transform)
+            bbox = transform_bounds(folium_crs, "EPSG:4326", *bounds_merc)
+
+            # Compute vmin/vmax ignoring NaNs
+            finite_mask = np.isfinite(vals)
+            if finite_mask.any():
+                vmin = float(vals[finite_mask].min())
+                vmax = float(vals[finite_mask].max())
+            else:
+                vmin, vmax = 0.0, 1.0  # degenerate: all NaN
+
+            # Prepare and add legend (Branca colorbar) if applicable (continuous only)
+            cm_for_palette = None
+            if isinstance(cmap, branca.colormap.ColorMap) and vmin != vmax and math.isfinite(vmin) and math.isfinite(vmax):
+                cm_for_palette = cmap.scale(vmin, vmax)
+                cm_for_palette.caption = name
+                cm_for_palette.add_to(self)
+
+            # Build a 256-color palette:
+            # - index 0 is reserved for NaN (transparent)
+            # - indices 1..255 span vmin..vmax (or a single color in binary/degenerate case)
+            palette = np.zeros((256, 3), dtype=np.uint8)
+            if cm_for_palette is not None:
+                sample_vals = np.linspace(vmin, vmax, 255, dtype=np.float32)
+                for i, v in enumerate(sample_vals, start=1):
+                    palette[i] = _parse_color_to_rgb(cm_for_palette(float(v)))
+            else:
+                # Fallback palette: grayscale for indices 1..255; may be overridden in degenerate case below
+                palette[1:, 0] = np.arange(1, 256, dtype=np.uint8)
+                palette[1:, 1] = np.arange(1, 256, dtype=np.uint8)
+                palette[1:, 2] = np.arange(1, 256, dtype=np.uint8)
+
+            # Map vals -> palette indices
+            idx = np.zeros(vals.shape, dtype=np.uint8)  # default 0 for NaN (transparent)
+            if finite_mask.any() and vmin != vmax and math.isfinite(vmin) and math.isfinite(vmax):
+                norm = np.clip((vals[finite_mask] - vmin) / (vmax - vmin), 0.0, 1.0)
+                idx_vals = 1 + (norm * 254.0).astype(np.uint8)  # 1..255
+                idx[finite_mask] = idx_vals
+            elif finite_mask.any():
+                # Degenerate range: all finite values are equal (e.g., 1). Map them to a visible index (255).
+                idx[finite_mask] = 255
+
+                # Choose the single inundation color for palette[255]
+                chosen_rgb = (31, 120, 180)  # default #1f78b4
+                if isinstance(cmap, dict):
+                    # Try explicit mapping for value 1, then vmin as float/int, else default
+                    color_spec = cmap.get(1, cmap.get(float(vmin), cmap.get(int(vmin), "#1f78b4")))
+                    chosen_rgb = _parse_color_to_rgb(color_spec)
+                elif isinstance(cmap, branca.colormap.ColorMap):
+                    # Sample a single color (at vmin or mid)
+                    try:
+                        color_spec = cmap(float(vmin))
+                    except Exception:
+                        color_spec = cmap(0.5) if hasattr(cmap, "__call__") else "#1f78b4"
+                    chosen_rgb = _parse_color_to_rgb(color_spec)
+                palette[255] = chosen_rgb
+
+            # NaNs remain 0 (transparent)
+
+            # Create a palettized PIL image (mode 'P') with transparency at index 0
+            img = Image.fromarray(idx, mode='P')
+            img.putpalette(palette.reshape(-1).tolist())
+            img.info['transparency'] = 0  # palette index 0 transparent
+
+            # Convert to a PNG data-URI string so Folium can serialize it
+            buf = io.BytesIO()
+            img.save(buf, format='PNG', optimize=True)
+            data_uri = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+
+            # Pass the data-URI to Folium (no colormap argument)
+            overlay = folium.raster_layers.ImageOverlay(
+                name=name,
+                image=data_uri,
+                bounds=[[bbox[1], bbox[0]], [bbox[3], bbox[2]]],
+                opacity=1.0,
+                interactive=False,
+                cross_origin=False,
+            )
+            overlay.add_to(self)
+            return overlay
+            
     def _add_vector(self,name:str,fname:str,name_in_file:str,cmap:branca.colormap.ColorMap|dict):
         """Add vector data to map"""
         if not os.path.isfile(fname): 
